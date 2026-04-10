@@ -151,11 +151,15 @@ fn staff_line_spacing(signal: &[f32]) -> Option<f32> {
     let best_bin = best_i + min_bin;
     let spacing = n as f32 / best_bin as f32;
 
-    // Correct for 2× harmonic: if the 2× frequency bin is also strong,
+    // Correct for 2× harmonic: if the 2× frequency bin is dominant,
     // the detected spacing may be a sub-harmonic — double it to get the true spacing.
+    // Only apply if the doubled spacing stays within the valid staff-line range (8–20px).
     let harmonic_bin = best_bin * 2;
     if harmonic_bin < mags.len() && mags[harmonic_bin] > best_mag * 0.8 {
-        return Some(spacing * 2.0);
+        let doubled = spacing * 2.0;
+        if doubled <= 20.0 {
+            return Some(doubled);
+        }
     }
 
     Some(spacing)
