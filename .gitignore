@@ -1,0 +1,25 @@
+# Build output
+/target/
+
+# pdfium native library (auto-downloaded by build.rs)
+libpdfium.dylib
+libpdfium.so
+pdfium.dll
+
+# Output PDFs and debug images
+/output/
+
+# Claude AI files
+.claude/
+
+# Test files and planning docs
+test.pdf
+PLAN.md
+
+# macOS
+.DS_Store
+
+# Environment / editor
+.env
+*.swp
+*.swo

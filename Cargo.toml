@@ -1,0 +1,16 @@
+[package]
+name = "sheet-music-splitter"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sms"
+path = "src/main.rs"
+
+[dependencies]
+clap       = { version = "4", features = ["derive"] }
+pdfium-render = { version = "0.8", features = ["thread_safe"] }
+image      = "0.25"
+realfft    = "3"
+lopdf      = "0.34"
+anyhow     = "1"
