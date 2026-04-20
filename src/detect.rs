@@ -80,7 +80,8 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
         let last_large_ratio = last_gap / median;
 
         // Prefer removing small-gap false staves (ratio < 0.75),
-        // then large-gap outliers at front/back (ratio > 1.8).
+        // then low-score outliers at front/back (score < 50% of median score),
+        // then large-gap outliers at front/back (ratio > 1.6).
         if small_gap_ratio < 0.75 {
             // Two staves too close — remove the one with lower convolution score
             let idx_a = stave_tops[min_idx] as usize;
@@ -92,12 +93,28 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
             } else {
                 stave_tops.remove(min_idx + 1);
             }
-        } else if first_large_ratio > 1.8 && first_gap >= last_gap {
-            stave_tops.remove(0);
-        } else if last_large_ratio > 1.8 {
-            stave_tops.pop();
         } else {
-            break; // no clear outlier found
+            // Check convolution scores at front/back for weak false detections
+            let scores: Vec<f32> = stave_tops.iter()
+                .map(|&y| { let i = y as usize; if i < conv.len() { conv[i] } else { 0.0 } })
+                .collect();
+            let mut sorted_scores = scores.clone();
+            sorted_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median_score = sorted_scores[sorted_scores.len() / 2];
+            let first_score = scores[0];
+            let last_score = *scores.last().unwrap();
+
+            if first_score < median_score * 0.5 && first_score <= last_score {
+                stave_tops.remove(0);
+            } else if last_score < median_score * 0.5 {
+                stave_tops.pop();
+            } else if first_large_ratio > 1.6 && first_gap >= last_gap {
+                stave_tops.remove(0);
+            } else if last_large_ratio > 1.6 {
+                stave_tops.pop();
+            } else {
+                break; // no clear outlier found
+            }
         }
     }
 
@@ -165,13 +182,29 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
         // This places boundaries in actual whitespace rather than between staves.
         let mut gap_top = [0f32; 3]; // top of gap between inst i and i+1
         let mut gap_bot = [0f32; 3]; // bottom of gap
+        let mut gap_mid_px = [0f32; 3]; // original gap midpoints (used as protrusion scan limits)
         for i in 0..3 {
             let (g_top, g_bot) = find_gap_edges(img, staff_bot_px[i], staff_top_px[i + 1]);
             gap_top[i] = g_top;
             gap_bot[i] = g_bot;
             let gap_mid = (g_top + g_bot) / 2.0;
+            gap_mid_px[i] = gap_mid;
             band_bot_px[i] = gap_mid;
             band_top_px[i + 1] = gap_mid;
+        }
+
+        // Tighten base bands: cap to 2.5× line_spacing above/below each staff.
+        // This keeps lines compact; protrusions extend where content actually needs more.
+        let max_pad = 2.5 * line_spacing;
+        for inst in 0..4 {
+            let tight_top = staff_top_px[inst] - max_pad;
+            if band_top_px[inst] < tight_top {
+                band_top_px[inst] = tight_top;
+            }
+            let tight_bot = staff_bot_px[inst] + max_pad;
+            if band_bot_px[inst] > tight_bot {
+                band_bot_px[inst] = tight_bot;
+            }
         }
 
         // Now scan for protrusions per instrument
@@ -184,15 +217,14 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
             // Scan upward: from base_top toward content above
             let scan_up_limit = if inst == 0 {
                 if sys == 0 {
-                    // First system on page: do NOT scan upward into title/header area
-                    base_top_px // no scan (limit == base = zero-sized region)
+                    base_top_px // no scan into title/header area
                 } else {
-                    // Scan up to the top of the system-to-system gap (not past it)
                     sys_gap_top[sys - 1]
                 }
             } else {
-                // Within system: scan up to the top of the inter-instrument gap
-                gap_top[inst - 1]
+                // Scan up to the original gap midpoint (before tightening),
+                // so protrusions can reclaim space where content actually exists.
+                gap_mid_px[inst - 1].min(base_top_px)
             };
 
             if base_top_px > scan_up_limit {
@@ -205,15 +237,13 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
             // Scan downward: from base_bot toward content below
             let scan_down_limit = if inst == 3 {
                 if sys == num_systems - 1 {
-                    // Last system on page: scan a modest amount below staff
                     (staff_bot_px[3] + 3.0 * line_spacing).min(h as f32)
                 } else {
-                    // Scan down to the bottom of the system-to-system gap (not past it)
                     sys_gap_bot[sys]
                 }
             } else {
-                // Within system: scan down to the bottom of the inter-instrument gap
-                gap_bot[inst]
+                // Scan down to the original gap midpoint (before tightening)
+                gap_mid_px[inst].max(base_bot_px)
             };
 
             if scan_down_limit > base_bot_px {
