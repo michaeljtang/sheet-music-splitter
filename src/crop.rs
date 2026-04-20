@@ -3,7 +3,7 @@ use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::detect::Band;
+use crate::detect::{Band, StripShape};
 
 const PAGE_W: f32 = 595.0;
 const PAGE_H: f32 = 842.0;
@@ -14,7 +14,7 @@ const MIN_GAP: f32 = 10.0; // minimum gap between strips when justifying
 /// `header`: region above the first system on page 0 (title/composer area).
 pub fn write_parts(
     src_path: &Path,
-    all_entries: &[Vec<(u32, Band)>; 4],
+    all_entries: &[Vec<(u32, StripShape)>; 4],
     header: Option<&Band>,
     part_names: &[&str],
     output_dir: &Path,
@@ -26,22 +26,22 @@ pub fn write_parts(
 
     // Header height (from page 0)
     let header_h = header.and_then(|hdr| {
-        let (page_idx, _) = all_entries[0][0];
-        let src_page_id = *src_pages.get(page_idx as usize)?;
+        let (page_idx, _) = &all_entries[0][0];
+        let src_page_id = *src_pages.get(*page_idx as usize)?;
         let (pw, _) = page_dims(&src, src_page_id);
         let h = (hdr.y_top - hdr.y_bot) * (avail_w / pw);
         if h > 0.0 { Some(h) } else { None }
     });
 
     for (inst_idx, entries) in all_entries.iter().enumerate() {
-        // Compute page breaks per instrument using its own strip heights
-        let strip_h: Vec<f32> = entries.iter().map(|&(page_idx, band)| {
-            let src_page_id = match src_pages.get(page_idx as usize) {
+        // Compute page breaks per instrument using its own strip heights (base band only)
+        let strip_h: Vec<f32> = entries.iter().map(|(page_idx, shape)| {
+            let src_page_id = match src_pages.get(*page_idx as usize) {
                 Some(&id) => id,
                 None => return 0.0,
             };
             let (pw, _) = page_dims(&src, src_page_id);
-            ((band.y_top - band.y_bot) * (avail_w / pw)).max(0.0)
+            ((shape.base.y_top - shape.base.y_bot) * (avail_w / pw)).max(0.0)
         }).collect();
 
         let page_breaks = compute_page_breaks(&strip_h, header_h);
@@ -78,7 +78,7 @@ fn compute_page_breaks(strip_heights: &[f32], header_h: Option<f32>) -> Vec<bool
 fn write_one_part(
     src: &Document,
     src_pages: &[ObjectId],
-    entries: &[(u32, Band)],
+    entries: &[(u32, StripShape)],
     header: Option<&Band>,
     page_breaks: &[bool],
     output_path: &Path,
@@ -102,12 +102,12 @@ fn write_one_part(
         Ok((id, pw))
     };
 
-    // A strip to render: source page xobject + band in source coords + scale
+    // A strip to render: source page xobject + shape in source coords + scale
     struct Strip {
         xobj_id: ObjectId,
-        band: Band,
+        shape: StripShape,
         scale: f32,
-        height: f32, // in output pts
+        height: f32, // in output pts (base band height only)
     }
 
     // Group systems into pages
@@ -120,10 +120,10 @@ fn write_one_part(
     let mut pages: Vec<PageGroup> = Vec::new();
     let mut cur_group: Option<PageGroup> = None;
 
-    for (sys_idx, &(page_idx, band)) in entries.iter().enumerate() {
-        let (xobj_id, pw) = get_xobj(page_idx, &mut out)?;
+    for (sys_idx, (page_idx, shape)) in entries.iter().enumerate() {
+        let (xobj_id, pw) = get_xobj(*page_idx, &mut out)?;
         let scale = avail_w / pw;
-        let h = (band.y_top - band.y_bot) * scale;
+        let h = (shape.base.y_top - shape.base.y_bot) * scale;
 
         if page_breaks[sys_idx] {
             if let Some(g) = cur_group.take() {
@@ -134,7 +134,12 @@ fn write_one_part(
                 header.and_then(|hdr| {
                     let h = (hdr.y_top - hdr.y_bot) * scale;
                     if h > 0.0 {
-                        Some(Strip { xobj_id, band: *hdr, scale, height: h })
+                        Some(Strip {
+                            xobj_id,
+                            shape: StripShape { base: *hdr, protrusions: Vec::new() },
+                            scale,
+                            height: h,
+                        })
                     } else {
                         None
                     }
@@ -146,7 +151,12 @@ fn write_one_part(
         }
 
         if h > 0.0 {
-            cur_group.as_mut().unwrap().systems.push(Strip { xobj_id, band, scale, height: h });
+            cur_group.as_mut().unwrap().systems.push(Strip {
+                xobj_id,
+                shape: shape.clone(),
+                scale,
+                height: h,
+            });
         }
     }
     if let Some(g) = cur_group {
@@ -184,14 +194,38 @@ fn write_one_part(
             let dest_y_top = cur_y;
             let dest_y_bot = dest_y_top - h;
             let tx = MARGIN;
-            let ty = dest_y_bot - strip.band.y_bot * strip.scale;
+            let ty = dest_y_bot - strip.shape.base.y_bot * strip.scale;
 
             let name = format!("X{}", xobj_counter);
             xobj_counter += 1;
             xobjs.push((name.clone(), strip.xobj_id));
-            streams.push(format!(
-                "q\n{x1} {y1} {w} {h} re W n\n{a} 0 0 {d} {tx} {ty} cm\n/{name} Do\nQ",
+
+            // Build clip path: base rectangle + protrusion rectangles
+            let mut clip_rects = format!(
+                "{x1} {y1} {w} {h} re",
                 x1 = MARGIN, y1 = dest_y_bot, w = avail_w, h = h,
+            );
+
+            // Add protrusion rectangles (in output coordinates)
+            for prot in &strip.shape.protrusions {
+                // Convert protrusion from source PDF coords to output coords
+                let prot_x = MARGIN + prot.x_left * strip.scale;
+                let prot_w = (prot.x_right - prot.x_left) * strip.scale;
+                // Protrusion y coords in source PDF space → output space
+                let prot_y_top_out = dest_y_bot + (prot.y_top - strip.shape.base.y_bot) * strip.scale;
+                let prot_y_bot_out = dest_y_bot + (prot.y_bot - strip.shape.base.y_bot) * strip.scale;
+                let prot_h = prot_y_top_out - prot_y_bot_out;
+                if prot_h > 0.0 && prot_w > 0.0 {
+                    clip_rects.push_str(&format!(
+                        "\n{x} {y} {w} {h} re",
+                        x = prot_x, y = prot_y_bot_out, w = prot_w, h = prot_h,
+                    ));
+                }
+            }
+
+            streams.push(format!(
+                "q\n{clip}\nW n\n{a} 0 0 {d} {tx} {ty} cm\n/{name} Do\nQ",
+                clip = clip_rects,
                 a = strip.scale, d = strip.scale, tx = tx, ty = ty, name = name,
             ));
             cur_y = dest_y_bot - gap;

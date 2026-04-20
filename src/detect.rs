@@ -10,17 +10,33 @@ pub struct Band {
     pub y_bot: f32,
 }
 
-/// Per-page detection result: a list of systems, each system has 4 bands.
+/// A rectangular protrusion extending beyond the base band, in PDF points.
+#[derive(Clone, Debug)]
+pub struct Protrusion {
+    pub x_left: f32,
+    pub x_right: f32,
+    pub y_top: f32,
+    pub y_bot: f32,
+}
+
+/// Full clip shape for one instrument strip: base rectangle + optional protrusions.
+#[derive(Clone, Debug)]
+pub struct StripShape {
+    pub base: Band,
+    pub protrusions: Vec<Protrusion>,
+}
+
+/// Per-page detection result: a list of systems, each system has 4 strip shapes.
 pub enum PageBands {
-    /// Systems detected: each inner array is [violin1, violin2, viola, cello] bands.
+    /// Systems detected: each inner array is [violin1, violin2, viola, cello] strip shapes.
     /// `first_staff_y_top`: PDF-point Y of the top of the first staff on this page
     /// (used to define the header region above system 1).
-    Systems { systems: Vec<[Band; 4]>, first_staff_y_top: f32 },
+    Systems { systems: Vec<[StripShape; 4]>, first_staff_y_top: f32 },
     /// No staves — copy full page to all outputs unchanged
     FullPage,
 }
 
-pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u32) -> PageBands {
+pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u32, min_padding_factor: f32) -> PageBands {
     let pts_per_px = 72.0 / dpi as f32;
     let (w, h) = img.dimensions();
 
@@ -42,7 +58,49 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
 
     let staff_span = 4.0 * line_spacing;
     let conv = comb_convolve(&signal, line_spacing);
-    let stave_tops = non_max_suppress(&conv, staff_span * 1.8);
+    let mut stave_tops = non_max_suppress(&conv, staff_span * 1.8);
+
+    // ── False-stave removal (only when count isn't divisible by 4) ────
+    // When we have extra staves (e.g. 9 instead of 8, 13 instead of 12),
+    // identify and remove false detections caused by 8va lines, title text,
+    // or other non-stave horizontal content.
+    while stave_tops.len() > 4 && stave_tops.len() % 4 != 0 {
+        let gaps: Vec<f32> = stave_tops.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut sorted = gaps.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = sorted[sorted.len() / 2];
+
+        // Find the most anomalous gap (smallest or largest relative to median)
+        let (min_idx, &min_gap) = gaps.iter().enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).unwrap();
+        let first_gap = gaps[0];
+        let last_gap = *gaps.last().unwrap();
+
+        let small_gap_ratio = min_gap / median;
+        let first_large_ratio = first_gap / median;
+        let last_large_ratio = last_gap / median;
+
+        // Prefer removing small-gap false staves (ratio < 0.75),
+        // then large-gap outliers at front/back (ratio > 1.8).
+        if small_gap_ratio < 0.75 {
+            // Two staves too close — remove the one with lower convolution score
+            let idx_a = stave_tops[min_idx] as usize;
+            let idx_b = stave_tops[min_idx + 1] as usize;
+            let score_a = if idx_a < conv.len() { conv[idx_a] } else { 0.0 };
+            let score_b = if idx_b < conv.len() { conv[idx_b] } else { 0.0 };
+            if score_a <= score_b {
+                stave_tops.remove(min_idx);
+            } else {
+                stave_tops.remove(min_idx + 1);
+            }
+        } else if first_large_ratio > 1.8 && first_gap >= last_gap {
+            stave_tops.remove(0);
+        } else if last_large_ratio > 1.8 {
+            stave_tops.pop();
+        } else {
+            break; // no clear outlier found
+        }
+    }
 
     if stave_tops.len() < 4 {
         eprintln!("  warning: only {} staves detected, using full page", stave_tops.len());
@@ -53,70 +111,382 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
     let stave_tops = &stave_tops[..n];
     let num_systems = n / 4;
 
-    // Group staves into systems: each consecutive group of 4 is one system
-    let mut systems: Vec<[Band; 4]> = Vec::with_capacity(num_systems);
+    let min_pad = min_padding_factor * line_spacing;
+    // Column width for per-column scanning: ~1 staff space
+    let col_width = (line_spacing.round() as u32).max(4);
+
+    // Pre-compute system-to-system gap edges (between cello of sys N and violin1 of sys N+1)
+    let mut sys_gap_top: Vec<f32> = Vec::new(); // indexed by gap index (0 = between sys 0 and 1)
+    let mut sys_gap_bot: Vec<f32> = Vec::new();
+    for s in 0..num_systems.saturating_sub(1) {
+        let cello_bot = stave_tops[s * 4 + 3] + staff_span;
+        let next_vln1_top = stave_tops[(s + 1) * 4];
+        let (gt, gb) = find_gap_edges(img, cello_bot, next_vln1_top);
+        sys_gap_top.push(gt);
+        sys_gap_bot.push(gb);
+    }
+
+    let mut systems: Vec<[StripShape; 4]> = Vec::with_capacity(num_systems);
 
     for sys in 0..num_systems {
         let sys_staves = &stave_tops[sys * 4..(sys + 1) * 4];
 
-        // Per-instrument bounds within this system
-        let mut inst_tops = [0f32; 4];
-        let mut inst_bots = [0f32; 4];
+        // Per-instrument staff edges (pixel coordinates, no padding)
+        let mut staff_top_px = [0f32; 4];
+        let mut staff_bot_px = [0f32; 4];
         for inst in 0..4 {
-            let top = sys_staves[inst];
-            let bot = top + staff_span;
-            // Top instrument gets extra room for tempo/text markings above the staff
-            let top_pad = if inst == 0 { 4.5 } else { 3.0 };
-            inst_tops[inst] = top - top_pad * line_spacing;
-            inst_bots[inst] = bot + 3.0 * line_spacing;
+            staff_top_px[inst] = sys_staves[inst];
+            staff_bot_px[inst] = sys_staves[inst] + staff_span;
         }
 
-        // Band boundaries: midpoint between adjacent instruments
+        // Base band boundaries (with fixed padding) — same as before
         let mut band_top_px = [0f32; 4];
         let mut band_bot_px = [h as f32; 4];
 
-        // System top: for first system, top of first instrument's staff region (header is above).
-        // For subsequent systems, midpoint between previous system bottom and this system top.
+        // Top of system boundary
         if sys == 0 {
-            band_top_px[0] = inst_tops[0];
+            let top_pad = 4.5 * line_spacing;
+            band_top_px[0] = (staff_top_px[0] - top_pad).max(0.0);
         } else {
-            let prev_last_bot = stave_tops[(sys - 1) * 4 + 3] + staff_span + 3.0 * line_spacing;
-            band_top_px[0] = (prev_last_bot + inst_tops[0]) / 2.0;
+            // Use midpoint of the system-to-system gap
+            let gap_mid = (sys_gap_top[sys - 1] + sys_gap_bot[sys - 1]) / 2.0;
+            band_top_px[0] = gap_mid;
         }
 
-        // System bottom: cap at inst_bots[3] for last system (don't extend to page edge)
+        // Bottom of system boundary
         if sys == num_systems - 1 {
-            band_bot_px[3] = inst_bots[3];
+            band_bot_px[3] = (staff_bot_px[3] + 3.0 * line_spacing).min(h as f32);
         } else {
-            let next_first_top = stave_tops[(sys + 1) * 4] - 3.0 * line_spacing;
-            let this_last_bot = inst_bots[3];
-            band_bot_px[3] = (this_last_bot + next_first_top) / 2.0;
+            // Use midpoint of the system-to-system gap
+            let gap_mid = (sys_gap_top[sys] + sys_gap_bot[sys]) / 2.0;
+            band_bot_px[3] = gap_mid;
         }
 
-        // Internal boundaries between instruments in this system
+        // Inter-instrument boundaries: find widest empty gap, split at its midpoint
+        // This places boundaries in actual whitespace rather than between staves.
+        let mut gap_top = [0f32; 3]; // top of gap between inst i and i+1
+        let mut gap_bot = [0f32; 3]; // bottom of gap
         for i in 0..3 {
-            let boundary = (inst_bots[i] + inst_tops[i + 1]) / 2.0;
-            band_bot_px[i] = boundary;
-            band_top_px[i + 1] = boundary;
+            let (g_top, g_bot) = find_gap_edges(img, staff_bot_px[i], staff_top_px[i + 1]);
+            gap_top[i] = g_top;
+            gap_bot[i] = g_bot;
+            let gap_mid = (g_top + g_bot) / 2.0;
+            band_bot_px[i] = gap_mid;
+            band_top_px[i + 1] = gap_mid;
         }
 
-        let mut bands = [Band { y_top: 0.0, y_bot: 0.0 }; 4];
-        for i in 0..4 {
-            let top_px = band_top_px[i].clamp(0.0, h as f32);
-            let bot_px = band_bot_px[i].clamp(0.0, h as f32);
-            bands[i] = Band {
-                y_top: (page_height_pts - top_px * pts_per_px).clamp(0.0, page_height_pts),
-                y_bot: (page_height_pts - bot_px * pts_per_px).clamp(0.0, page_height_pts),
+        // Now scan for protrusions per instrument
+        let shapes: [StripShape; 4] = std::array::from_fn(|inst| {
+            let base_top_px = band_top_px[inst];
+            let base_bot_px = band_bot_px[inst];
+
+            let mut protrusions_px: Vec<(u32, u32, f32, f32)> = Vec::new(); // (x_left, x_right, y_top, y_bot) in pixels
+
+            // Scan upward: from base_top toward content above
+            let scan_up_limit = if inst == 0 {
+                if sys == 0 {
+                    // First system on page: do NOT scan upward into title/header area
+                    base_top_px // no scan (limit == base = zero-sized region)
+                } else {
+                    // Scan up to the top of the system-to-system gap (not past it)
+                    sys_gap_top[sys - 1]
+                }
+            } else {
+                // Within system: scan up to the top of the inter-instrument gap
+                gap_top[inst - 1]
             };
-        }
-        systems.push(bands);
+
+            if base_top_px > scan_up_limit {
+                let up_protrusions = scan_protrusions_in_region(
+                    img, scan_up_limit, base_top_px, col_width, min_pad, true,
+                );
+                protrusions_px.extend(up_protrusions);
+            }
+
+            // Scan downward: from base_bot toward content below
+            let scan_down_limit = if inst == 3 {
+                if sys == num_systems - 1 {
+                    // Last system on page: scan a modest amount below staff
+                    (staff_bot_px[3] + 3.0 * line_spacing).min(h as f32)
+                } else {
+                    // Scan down to the bottom of the system-to-system gap (not past it)
+                    sys_gap_bot[sys]
+                }
+            } else {
+                // Within system: scan down to the bottom of the inter-instrument gap
+                gap_bot[inst]
+            };
+
+            if scan_down_limit > base_bot_px {
+                let down_protrusions = scan_protrusions_in_region(
+                    img, base_bot_px, scan_down_limit, col_width, min_pad, false,
+                );
+                protrusions_px.extend(down_protrusions);
+            }
+
+            // Convert everything to PDF coordinates
+            let base = Band {
+                y_top: (page_height_pts - base_top_px * pts_per_px).clamp(0.0, page_height_pts),
+                y_bot: (page_height_pts - base_bot_px * pts_per_px).clamp(0.0, page_height_pts),
+            };
+
+            let protrusions: Vec<Protrusion> = protrusions_px
+                .iter()
+                .map(|&(xl, xr, yt, yb)| Protrusion {
+                    x_left: xl as f32 * pts_per_px,
+                    x_right: xr as f32 * pts_per_px,
+                    y_top: (page_height_pts - yt * pts_per_px).clamp(0.0, page_height_pts),
+                    y_bot: (page_height_pts - yb * pts_per_px).clamp(0.0, page_height_pts),
+                })
+                .collect();
+
+            StripShape { base, protrusions }
+        });
+
+        systems.push(shapes);
     }
 
     let _ = page_width_pts;
-    // first_staff_y_top: top of first instrument's staff region on this page (in PDF pts)
-    let first_staff_top_px = stave_tops[0] - 3.0 * line_spacing;
-    let first_staff_y_top = (page_height_pts - first_staff_top_px * pts_per_px).clamp(0.0, page_height_pts);
+    // Header: scan downward from the top of the page to find where the first
+    // system's content truly begins. The header should capture title, subtitle,
+    // composer, tempo, and rehearsal markings above the first stave.
+    // Use 6× line_spacing below the first stave top as the header extent — this
+    // captures tempo markings that sit just above the staff.
+    let header_bottom_px = stave_tops[0] - 6.0 * line_spacing;
+    let first_staff_y_top = (page_height_pts - header_bottom_px.max(0.0) * pts_per_px).clamp(0.0, page_height_pts);
     PageBands::Systems { systems, first_staff_y_top }
+}
+
+/// Find the widest empty gap between two adjacent staves.
+/// Returns (gap_top, gap_bot) in pixel rows — the top and bottom edges of the
+/// widest run of empty rows. If no gap is found, returns the midpoint.
+fn find_gap_edges(img: &GrayImage, staff_bot: f32, next_staff_top: f32) -> (f32, f32) {
+    let (w, h) = img.dimensions();
+    let gap_start = (staff_bot.ceil() as u32).min(h - 1);
+    let gap_end = (next_staff_top.floor() as u32).min(h - 1);
+    let midpoint = (staff_bot + next_staff_top) / 2.0;
+
+    if gap_start >= gap_end {
+        return (midpoint, midpoint);
+    }
+
+    let x_margin = w / 20;
+    let x0 = x_margin;
+    let x1 = w - x_margin;
+    let dark_threshold: u8 = 200;
+
+    let row_counts: Vec<u32> = (gap_start..=gap_end)
+        .map(|y| {
+            (x0..x1)
+                .filter(|&x| img.get_pixel(x, y).0[0] < dark_threshold)
+                .count() as u32
+        })
+        .collect();
+
+    let n = row_counts.len();
+    let smoothed: Vec<f32> = (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(2);
+            let hi = (i + 3).min(n);
+            row_counts[lo..hi].iter().sum::<u32>() as f32 / (hi - lo) as f32
+        })
+        .collect();
+
+    let ink_threshold = 2.0;
+    let has_ink: Vec<bool> = smoothed.iter().map(|&v| v > ink_threshold).collect();
+
+    // Find widest run of empty rows
+    let mut best_start = 0usize;
+    let mut best_len = 0usize;
+    let mut run_start = 0usize;
+    let mut run_len = 0usize;
+    let mut in_run = false;
+
+    for (i, &has) in has_ink.iter().enumerate() {
+        if !has {
+            if !in_run {
+                run_start = i;
+                run_len = 0;
+                in_run = true;
+            }
+            run_len += 1;
+        } else {
+            if in_run && run_len > best_len {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            in_run = false;
+        }
+    }
+    if in_run && run_len > best_len {
+        best_start = run_start;
+        best_len = run_len;
+    }
+
+    if best_len == 0 {
+        return (midpoint, midpoint);
+    }
+
+    let g_top = gap_start as f32 + best_start as f32;
+    let g_bot = g_top + best_len as f32;
+    (g_top, g_bot)
+}
+
+/// Scan a region beyond a base band edge for ink connected to the current instrument.
+/// Works outward from the band edge, stopping at whitespace gaps to avoid capturing
+/// the neighboring instrument's content.
+///
+/// `region_top_px` < `region_bot_px` (pixel coords, y increases downward).
+/// `extending_up`: if true, scans upward from region_bot_px (the base band's top edge);
+///   if false, scans downward from region_top_px (the base band's bottom edge).
+fn scan_protrusions_in_region(
+    img: &GrayImage,
+    region_top_px: f32,
+    region_bot_px: f32,
+    col_width: u32,
+    pad_px: f32,
+    extending_up: bool,
+) -> Vec<(u32, u32, f32, f32)> {
+    let (w, h) = img.dimensions();
+    let dark_threshold: u8 = 200;
+    let ink_count_threshold: u32 = 2;
+    // Max gap of empty rows before we stop — prevents jumping to neighboring instrument
+    let max_gap = (pad_px * 0.75).max(4.0) as u32;
+
+    let r_top = (region_top_px.ceil() as u32).min(h - 1);
+    let r_bot = (region_bot_px.floor() as u32).min(h - 1);
+    if r_top >= r_bot {
+        return Vec::new();
+    }
+
+    let x_margin = w / 20;
+    let x_start = x_margin;
+    let x_end = w - x_margin;
+
+    struct ColInk {
+        x_left: u32,
+        x_right: u32,
+        ink_edge: f32,
+    }
+
+    let mut col_inks: Vec<ColInk> = Vec::new();
+
+    let mut col_x = x_start;
+    while col_x < x_end {
+        let col_right = (col_x + col_width).min(x_end);
+
+        // Scan outward from the band edge, tracking connected ink
+        let ink_edge = if extending_up {
+            // Scan from r_bot-1 upward (decreasing y) toward r_top
+            let mut farthest: Option<u32> = None;
+            let mut gap_count = 0u32;
+
+            let start_y = r_bot.saturating_sub(1);
+            if start_y >= r_top {
+                for y in (r_top..=start_y).rev() {
+                    let has_ink = (col_x..col_right)
+                        .filter(|&x| img.get_pixel(x, y).0[0] < dark_threshold)
+                        .count() as u32 >= ink_count_threshold;
+
+                    if has_ink {
+                        farthest = Some(farthest.map_or(y, |f: u32| f.min(y)));
+                        gap_count = 0;
+                    } else {
+                        gap_count += 1;
+                        if farthest.is_some() && gap_count > max_gap {
+                            break; // hit a large gap — stop, rest belongs to neighbor
+                        }
+                    }
+                }
+            }
+            farthest
+        } else {
+            // Scan from r_top downward (increasing y) toward r_bot
+            let mut farthest: Option<u32> = None;
+            let mut gap_count = 0u32;
+
+            let start_y = r_top;
+            if start_y < r_bot {
+                for y in start_y..r_bot {
+                    let has_ink = (col_x..col_right)
+                        .filter(|&x| img.get_pixel(x, y).0[0] < dark_threshold)
+                        .count() as u32 >= ink_count_threshold;
+
+                    if has_ink {
+                        farthest = Some(farthest.map_or(y, |f: u32| f.max(y)));
+                        gap_count = 0;
+                    } else {
+                        gap_count += 1;
+                        if farthest.is_some() && gap_count > max_gap {
+                            break;
+                        }
+                    }
+                }
+            }
+            farthest
+        };
+
+        if let Some(edge) = ink_edge {
+            col_inks.push(ColInk {
+                x_left: col_x,
+                x_right: col_right,
+                ink_edge: edge as f32,
+            });
+        }
+
+        col_x = col_right;
+    }
+
+    if col_inks.is_empty() {
+        return Vec::new();
+    }
+
+    // Merge adjacent columns with ink into wider protrusion rectangles
+    let mut protrusions: Vec<(u32, u32, f32, f32)> = Vec::new();
+    let mut group_start = 0usize;
+
+    while group_start < col_inks.len() {
+        let mut group_end = group_start;
+        let mut farthest = col_inks[group_start].ink_edge;
+
+        // Merge adjacent columns (allow a 1-column gap for robustness)
+        while group_end + 1 < col_inks.len() {
+            let gap = col_inks[group_end + 1].x_left - col_inks[group_end].x_right;
+            if gap <= col_width {
+                group_end += 1;
+                if extending_up {
+                    farthest = farthest.min(col_inks[group_end].ink_edge);
+                } else {
+                    farthest = farthest.max(col_inks[group_end].ink_edge);
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Add padding around the ink
+        let padded_edge = if extending_up {
+            (farthest - pad_px).max(0.0)
+        } else {
+            (farthest + pad_px).min(h as f32)
+        };
+
+        // Protrusion extends from the base band edge to the padded ink edge
+        let x_left = col_inks[group_start].x_left.saturating_sub(col_width / 2);
+        let x_right = (col_inks[group_end].x_right + col_width / 2).min(w);
+
+        let (y_top, y_bot) = if extending_up {
+            (padded_edge, region_bot_px)
+        } else {
+            (region_top_px, padded_edge)
+        };
+
+        protrusions.push((x_left, x_right, y_top, y_bot));
+
+        group_start = group_end + 1;
+    }
+
+    protrusions
 }
 
 fn staff_line_spacing(signal: &[f32]) -> Option<f32> {
