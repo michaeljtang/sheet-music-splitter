@@ -3,7 +3,7 @@ use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::detect::{Band, StripShape};
+use crate::detect::StripShape;
 
 const PAGE_W: f32 = 595.0;
 const PAGE_H: f32 = 842.0;
@@ -11,11 +11,11 @@ const MARGIN: f32 = 36.0;
 const MIN_GAP: f32 = 10.0; // minimum gap between strips when justifying
 
 /// Write one output PDF per instrument.
-/// `header`: region above the first system on page 0 (title/composer area).
+/// `header`: region above the first system on page 0 (title/composer/tempo area).
 pub fn write_parts(
     src_path: &Path,
     all_entries: &[Vec<(u32, StripShape)>; 4],
-    header: Option<&Band>,
+    header: Option<&StripShape>,
     part_names: &[&str],
     output_dir: &Path,
 ) -> Result<()> {
@@ -29,7 +29,7 @@ pub fn write_parts(
         let (page_idx, _) = &all_entries[0][0];
         let src_page_id = *src_pages.get(*page_idx as usize)?;
         let (pw, _) = page_dims(&src, src_page_id);
-        let h = (hdr.y_top - hdr.y_bot) * (avail_w / pw);
+        let h = (hdr.base.y_top - hdr.base.y_bot) * (avail_w / pw);
         if h > 0.0 { Some(h) } else { None }
     });
 
@@ -44,9 +44,18 @@ pub fn write_parts(
             ((shape.base.y_top - shape.base.y_bot) * (avail_w / pw)).max(0.0)
         }).collect();
 
+        // Violin 1 (inst 0) already has the tempo area in its band — skip header protrusions.
+        let inst_header = header.map(|hdr| {
+            if inst_idx == 0 {
+                StripShape { base: hdr.base, protrusions: Vec::new() }
+            } else {
+                hdr.clone()
+            }
+        });
+
         let page_breaks = compute_page_breaks(&strip_h, header_h);
         let out_path = output_dir.join(format!("{}.pdf", part_names[inst_idx]));
-        let n = write_one_part(&src, &src_pages, entries, header, &page_breaks, &out_path)?;
+        let n = write_one_part(&src, &src_pages, entries, inst_header.as_ref(), &page_breaks, &out_path)?;
         println!("Wrote {} ({} pages)", out_path.display(), n);
     }
 
@@ -79,7 +88,7 @@ fn write_one_part(
     src: &Document,
     src_pages: &[ObjectId],
     entries: &[(u32, StripShape)],
-    header: Option<&Band>,
+    header: Option<&StripShape>,
     page_breaks: &[bool],
     output_path: &Path,
 ) -> Result<usize> {
@@ -132,11 +141,11 @@ fn write_one_part(
             // New page group
             let hdr_strip = if sys_idx == 0 {
                 header.and_then(|hdr| {
-                    let h = (hdr.y_top - hdr.y_bot) * scale;
+                    let h = (hdr.base.y_top - hdr.base.y_bot) * scale;
                     if h > 0.0 {
                         Some(Strip {
                             xobj_id,
-                            shape: StripShape { base: *hdr, protrusions: Vec::new() },
+                            shape: hdr.clone(),
                             scale,
                             height: h,
                         })

@@ -29,9 +29,8 @@ pub struct StripShape {
 /// Per-page detection result: a list of systems, each system has 4 strip shapes.
 pub enum PageBands {
     /// Systems detected: each inner array is [violin1, violin2, viola, cello] strip shapes.
-    /// `first_staff_y_top`: PDF-point Y of the top of the first staff on this page
-    /// (used to define the header region above system 1).
-    Systems { systems: Vec<[StripShape; 4]>, first_staff_y_top: f32 },
+    /// `header`: StripShape for the title/composer/tempo area above system 1.
+    Systems { systems: Vec<[StripShape; 4]>, header: StripShape },
     /// No staves — copy full page to all outputs unchanged
     FullPage,
 }
@@ -247,14 +246,42 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
     }
 
     let _ = page_width_pts;
-    // Header: scan downward from the top of the page to find where the first
-    // system's content truly begins. The header should capture title, subtitle,
-    // composer, tempo, and rehearsal markings above the first stave.
-    // Use 6× line_spacing below the first stave top as the header extent — this
-    // captures tempo markings that sit just above the staff.
-    let header_bottom_px = stave_tops[0] - 6.0 * line_spacing;
-    let first_staff_y_top = (page_height_pts - header_bottom_px.max(0.0) * pts_per_px).clamp(0.0, page_height_pts);
-    PageBands::Systems { systems, first_staff_y_top }
+    // Header: base captures title/composer area; protrusions reach down to
+    // capture tempo markings and rehearsal letters that sit just above the stave.
+    // Base bottom = 4.5 * line_spacing above the first stave (matches violin 1's band top).
+    let header_base_bot_px = (stave_tops[0] - 4.5 * line_spacing).max(0.0);
+    // Scan for content between header base and just above the first stave.
+    // Stop 2.5× line_spacing above stave top to avoid clipping into the staff
+    // (the protrusion scanner adds padding beyond detected ink).
+    let scan_top = header_base_bot_px;
+    let scan_bot = (stave_tops[0] - 2.5 * line_spacing).max(scan_top);
+    let mut header_protrusions_px: Vec<(u32, u32, f32, f32)> = Vec::new();
+    if scan_bot > scan_top + 2.0 {
+        let prots = scan_protrusions_in_region(
+            img, scan_top, scan_bot, col_width, min_pad, false,
+        );
+        for (xl, xr, yt, yb) in prots {
+            // Clamp to scan region so padding doesn't push into violin 1's staff
+            header_protrusions_px.push((xl, xr, yt, yb.min(scan_bot)));
+        }
+    }
+
+    let header_base = Band {
+        y_top: page_height_pts,
+        y_bot: (page_height_pts - header_base_bot_px * pts_per_px).clamp(0.0, page_height_pts),
+    };
+    let header_protrusions: Vec<Protrusion> = header_protrusions_px
+        .iter()
+        .map(|&(xl, xr, yt, yb)| Protrusion {
+            x_left: xl as f32 * pts_per_px,
+            x_right: xr as f32 * pts_per_px,
+            y_top: (page_height_pts - yt * pts_per_px).clamp(0.0, page_height_pts),
+            y_bot: (page_height_pts - yb * pts_per_px).clamp(0.0, page_height_pts),
+        })
+        .collect();
+    let header = StripShape { base: header_base, protrusions: header_protrusions };
+
+    PageBands::Systems { systems, header }
 }
 
 /// Find the widest empty gap between two adjacent staves.

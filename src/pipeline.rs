@@ -26,7 +26,7 @@ pub fn run(input: &Path, output_dir: &Path, dpi: u32, debug: bool, min_padding_f
     println!("Processing '{}' ({} pages)...", piece_name, page_count);
 
     let mut entries: [Vec<(String, u32, StripShape)>; 4] = Default::default();
-    let mut header: Option<Band> = None;
+    let mut header: Option<StripShape> = None;
 
     for page_idx in 0..page_count {
         let page = doc.pages().get(page_idx as u16).context("page access")?;
@@ -50,14 +50,14 @@ pub fn run(input: &Path, output_dir: &Path, dpi: u32, debug: bool, min_padding_f
 
         print!("  page {}/{}: ", page_idx + 1, page_count);
         match &bands {
-            PageBands::Systems { systems, first_staff_y_top } => {
+            PageBands::Systems { systems, header: page_header } => {
                 println!("{} systems", systems.len());
                 if debug {
                     save_debug_image(&gray, systems, &piece_dir, page_idx, height_pts, dpi)?;
                 }
                 // Capture header from the very first page's first system
                 if page_idx == 0 && header.is_none() {
-                    header = Some(Band { y_top: height_pts, y_bot: *first_staff_y_top });
+                    header = Some(page_header.clone());
                 }
                 for system in systems {
                     for inst in 0..4 {
