@@ -34,14 +34,24 @@ pub fn write_parts(
     });
 
     for (inst_idx, entries) in all_entries.iter().enumerate() {
-        // Compute page breaks per instrument using its own strip heights (base band only)
-        let strip_h: Vec<f32> = entries.iter().map(|(page_idx, shape)| {
+        // Compute page breaks per instrument using its own strip heights
+        let strip_info: Vec<(f32, f32, f32)> = entries.iter().map(|(page_idx, shape)| {
             let src_page_id = match src_pages.get(*page_idx as usize) {
                 Some(&id) => id,
-                None => return 0.0,
+                None => return (0.0, 0.0, 0.0),
             };
             let (pw, _) = page_dims(&src, src_page_id);
-            ((shape.base.y_top - shape.base.y_bot) * (avail_w / pw)).max(0.0)
+            let scale = avail_w / pw;
+            let h = ((shape.base.y_top - shape.base.y_bot) * scale).max(0.0);
+            let ea: f32 = shape.protrusions.iter()
+                .filter(|p| p.y_top > shape.base.y_top)
+                .map(|p| (p.y_top - shape.base.y_top) * scale)
+                .fold(0.0f32, f32::max);
+            let eb: f32 = shape.protrusions.iter()
+                .filter(|p| p.y_bot < shape.base.y_bot)
+                .map(|p| (shape.base.y_bot - p.y_bot) * scale)
+                .fold(0.0f32, f32::max);
+            (h, ea, eb)
         }).collect();
 
         // Violin 1 (inst 0) already has the tempo area in its band — skip header protrusions.
@@ -53,7 +63,7 @@ pub fn write_parts(
             }
         });
 
-        let page_breaks = compute_page_breaks(&strip_h, header_h);
+        let page_breaks = compute_page_breaks(&strip_info, header_h);
         let out_path = output_dir.join(format!("{}.pdf", part_names[inst_idx]));
         let n = write_one_part(&src, &src_pages, entries, inst_header.as_ref(), &page_breaks, &out_path)?;
         println!("Wrote {} ({} pages)", out_path.display(), n);
@@ -63,22 +73,26 @@ pub fn write_parts(
 }
 
 /// Returns a bool per system: true = this system starts a new output page.
-fn compute_page_breaks(strip_heights: &[f32], header_h: Option<f32>) -> Vec<bool> {
+/// strip_info: Vec of (base_height, extend_above, extend_below) per strip.
+fn compute_page_breaks(strip_info: &[(f32, f32, f32)], header_h: Option<f32>) -> Vec<bool> {
     let avail = PAGE_H - 2.0 * MARGIN;
-    let mut breaks = vec![false; strip_heights.len()];
+    let mut breaks = vec![false; strip_info.len()];
     let mut cur_h = header_h.map(|h| h + MIN_GAP).unwrap_or(0.0);
 
-    for (i, &h) in strip_heights.iter().enumerate() {
+    for (i, &(h, ea, _eb)) in strip_info.iter().enumerate() {
         if i == 0 {
             breaks[0] = true;
             cur_h += h;
             continue;
         }
-        if cur_h + MIN_GAP + h > avail {
+        // Gap between prev strip and this one accounts for protrusions
+        let prev_eb = strip_info[i - 1].2;
+        let gap = MIN_GAP + prev_eb + ea;
+        if cur_h + gap + h > avail {
             breaks[i] = true;
             cur_h = h;
         } else {
-            cur_h += MIN_GAP + h;
+            cur_h += gap + h;
         }
     }
     breaks
@@ -95,8 +109,6 @@ fn write_one_part(
     let mut out = Document::with_version("1.5");
     let pages_id = out.new_object_id();
     let avail_w = PAGE_W - 2.0 * MARGIN;
-    let avail_h = PAGE_H - 2.0 * MARGIN;
-
     let mut xobj_cache: BTreeMap<u32, (ObjectId, f32)> = BTreeMap::new();
 
     // Pre-fetch XObject for a page, caching results
@@ -116,7 +128,7 @@ fn write_one_part(
         xobj_id: ObjectId,
         shape: StripShape,
         scale: f32,
-        height: f32, // in output pts (base band height only)
+        height: f32,     // base band height in output pts
     }
 
     // Group systems into pages
@@ -183,22 +195,30 @@ fn write_one_part(
             continue;
         }
 
-        let total_h: f32 = all_strips.iter().map(|s| s.height).sum();
-        let num_gaps = if n > 1 { n - 1 } else { 0 };
-        // Justify spacing, but cap the gap so sparse pages don't look too spread out.
-        let max_gap = 2.5 * MIN_GAP;
-        let gap = if num_gaps > 0 {
-            let justified = (avail_h - total_h) / num_gaps as f32;
-            justified.clamp(MIN_GAP, max_gap)
-        } else {
-            0.0
-        };
+        // Compute gaps between consecutive strips.
+        // Ensure at least MIN_GAP between the visual extents (including protrusions).
+        let gaps: Vec<f32> = (0..n.saturating_sub(1)).map(|i| {
+            let strip_a = all_strips[i];
+            let strip_b = all_strips[i + 1];
+            // How far strip_a's protrusions extend below its base band (in output pts)
+            let a_below: f32 = strip_a.shape.protrusions.iter()
+                .filter(|p| p.y_bot < strip_a.shape.base.y_bot)
+                .map(|p| (strip_a.shape.base.y_bot - p.y_bot) * strip_a.scale)
+                .fold(0.0f32, f32::max);
+            // How far strip_b's protrusions extend above its base band (in output pts)
+            let b_above: f32 = strip_b.shape.protrusions.iter()
+                .filter(|p| p.y_top > strip_b.shape.base.y_top)
+                .map(|p| (p.y_top - strip_b.shape.base.y_top) * strip_b.scale)
+                .fold(0.0f32, f32::max);
+            // Gap must accommodate both protrusions plus MIN_GAP clearance
+            MIN_GAP + a_below + b_above
+        }).collect();
 
         let mut streams: Vec<String> = Vec::new();
         let mut xobjs: Vec<(String, ObjectId)> = Vec::new();
         let mut cur_y = PAGE_H - MARGIN;
 
-        for strip in &all_strips {
+        for (strip_idx, strip) in all_strips.iter().enumerate() {
             let h = strip.height;
             let dest_y_top = cur_y;
             let dest_y_bot = dest_y_top - h;
@@ -237,7 +257,9 @@ fn write_one_part(
                 clip = clip_rects,
                 a = strip.scale, d = strip.scale, tx = tx, ty = ty, name = name,
             ));
-            cur_y = dest_y_bot - gap;
+            // Use per-gap spacing to prevent protrusion overlap
+            let this_gap = if strip_idx < gaps.len() { gaps[strip_idx] } else { 0.0 };
+            cur_y = dest_y_bot - this_gap;
         }
 
         let content_id = out.add_object(Stream::new(

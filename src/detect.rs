@@ -219,7 +219,9 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
                 if sys == 0 {
                     base_top_px // no scan into title/header area
                 } else {
-                    sys_gap_top[sys - 1]
+                    // Use system gap midpoint, not the far edge
+                    let gap_mid = (sys_gap_top[sys - 1] + sys_gap_bot[sys - 1]) / 2.0;
+                    gap_mid.min(base_top_px)
                 }
             } else {
                 // Scan up to the original gap midpoint (before tightening),
@@ -239,7 +241,10 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
                 if sys == num_systems - 1 {
                     (staff_bot_px[3] + 3.0 * line_spacing).min(h as f32)
                 } else {
-                    sys_gap_bot[sys]
+                    // Use system gap midpoint, not the far edge — prevents scanning
+                    // deep into the next system's territory
+                    let gap_mid = (sys_gap_top[sys] + sys_gap_bot[sys]) / 2.0;
+                    gap_mid.max(base_bot_px)
                 }
             } else {
                 // Scan down to the original gap midpoint (before tightening)
@@ -281,10 +286,10 @@ pub fn detect(img: &GrayImage, page_height_pts: f32, page_width_pts: f32, dpi: u
     // Base bottom = 4.5 * line_spacing above the first stave (matches violin 1's band top).
     let header_base_bot_px = (stave_tops[0] - 4.5 * line_spacing).max(0.0);
     // Scan for content between header base and just above the first stave.
-    // Stop 2.5× line_spacing above stave top to avoid clipping into the staff
-    // (the protrusion scanner adds padding beyond detected ink).
+    // Stop 1.5× line_spacing above stave top — close enough to capture the full
+    // tempo marking without clipping into the staff itself.
     let scan_top = header_base_bot_px;
-    let scan_bot = (stave_tops[0] - 2.5 * line_spacing).max(scan_top);
+    let scan_bot = (stave_tops[0] - 1.5 * line_spacing).max(scan_top);
     let mut header_protrusions_px: Vec<(u32, u32, f32, f32)> = Vec::new();
     if scan_bot > scan_top + 2.0 {
         let prots = scan_protrusions_in_region(
