@@ -23,10 +23,15 @@ struct Args {
     /// Write debug PNGs with detected band boundaries
     #[arg(long)]
     debug: bool,
+
+    /// Minimum padding factor (multiples of staff line spacing) for content-aware
+    /// boundary detection between instruments. Higher = more clearance.
+    #[arg(long, default_value_t = 2.0)]
+    min_padding_factor: f32,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     std::fs::create_dir_all(&args.output_dir)?;
-    pipeline::run(&args.input, &args.output_dir, args.dpi, args.debug)
+    pipeline::run(&args.input, &args.output_dir, args.dpi, args.debug, args.min_padding_factor)
 }

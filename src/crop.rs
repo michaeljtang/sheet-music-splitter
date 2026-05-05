@@ -3,7 +3,7 @@ use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::detect::Band;
+use crate::detect::StripShape;
 
 const PAGE_W: f32 = 595.0;
 const PAGE_H: f32 = 842.0;
@@ -11,11 +11,11 @@ const MARGIN: f32 = 36.0;
 const MIN_GAP: f32 = 10.0; // minimum gap between strips when justifying
 
 /// Write one output PDF per instrument.
-/// `header`: region above the first system on page 0 (title/composer area).
+/// `header`: region above the first system on page 0 (title/composer/tempo area).
 pub fn write_parts(
     src_path: &Path,
-    all_entries: &[Vec<(u32, Band)>; 4],
-    header: Option<&Band>,
+    all_entries: &[Vec<(u32, StripShape)>; 4],
+    header: Option<&StripShape>,
     part_names: &[&str],
     output_dir: &Path,
 ) -> Result<()> {
@@ -26,27 +26,46 @@ pub fn write_parts(
 
     // Header height (from page 0)
     let header_h = header.and_then(|hdr| {
-        let (page_idx, _) = all_entries[0][0];
-        let src_page_id = *src_pages.get(page_idx as usize)?;
+        let (page_idx, _) = &all_entries[0][0];
+        let src_page_id = *src_pages.get(*page_idx as usize)?;
         let (pw, _) = page_dims(&src, src_page_id);
-        let h = (hdr.y_top - hdr.y_bot) * (avail_w / pw);
+        let h = (hdr.base.y_top - hdr.base.y_bot) * (avail_w / pw);
         if h > 0.0 { Some(h) } else { None }
     });
 
     for (inst_idx, entries) in all_entries.iter().enumerate() {
         // Compute page breaks per instrument using its own strip heights
-        let strip_h: Vec<f32> = entries.iter().map(|&(page_idx, band)| {
-            let src_page_id = match src_pages.get(page_idx as usize) {
+        let strip_info: Vec<(f32, f32, f32)> = entries.iter().map(|(page_idx, shape)| {
+            let src_page_id = match src_pages.get(*page_idx as usize) {
                 Some(&id) => id,
-                None => return 0.0,
+                None => return (0.0, 0.0, 0.0),
             };
             let (pw, _) = page_dims(&src, src_page_id);
-            ((band.y_top - band.y_bot) * (avail_w / pw)).max(0.0)
+            let scale = avail_w / pw;
+            let h = ((shape.base.y_top - shape.base.y_bot) * scale).max(0.0);
+            let ea: f32 = shape.protrusions.iter()
+                .filter(|p| p.y_top > shape.base.y_top)
+                .map(|p| (p.y_top - shape.base.y_top) * scale)
+                .fold(0.0f32, f32::max);
+            let eb: f32 = shape.protrusions.iter()
+                .filter(|p| p.y_bot < shape.base.y_bot)
+                .map(|p| (shape.base.y_bot - p.y_bot) * scale)
+                .fold(0.0f32, f32::max);
+            (h, ea, eb)
         }).collect();
 
-        let page_breaks = compute_page_breaks(&strip_h, header_h);
+        // Violin 1 (inst 0) already has the tempo area in its band — skip header protrusions.
+        let inst_header = header.map(|hdr| {
+            if inst_idx == 0 {
+                StripShape { base: hdr.base, protrusions: Vec::new() }
+            } else {
+                hdr.clone()
+            }
+        });
+
+        let page_breaks = compute_page_breaks(&strip_info, header_h);
         let out_path = output_dir.join(format!("{}.pdf", part_names[inst_idx]));
-        let n = write_one_part(&src, &src_pages, entries, header, &page_breaks, &out_path)?;
+        let n = write_one_part(&src, &src_pages, entries, inst_header.as_ref(), &page_breaks, &out_path)?;
         println!("Wrote {} ({} pages)", out_path.display(), n);
     }
 
@@ -54,22 +73,26 @@ pub fn write_parts(
 }
 
 /// Returns a bool per system: true = this system starts a new output page.
-fn compute_page_breaks(strip_heights: &[f32], header_h: Option<f32>) -> Vec<bool> {
+/// strip_info: Vec of (base_height, extend_above, extend_below) per strip.
+fn compute_page_breaks(strip_info: &[(f32, f32, f32)], header_h: Option<f32>) -> Vec<bool> {
     let avail = PAGE_H - 2.0 * MARGIN;
-    let mut breaks = vec![false; strip_heights.len()];
+    let mut breaks = vec![false; strip_info.len()];
     let mut cur_h = header_h.map(|h| h + MIN_GAP).unwrap_or(0.0);
 
-    for (i, &h) in strip_heights.iter().enumerate() {
+    for (i, &(h, ea, _eb)) in strip_info.iter().enumerate() {
         if i == 0 {
             breaks[0] = true;
             cur_h += h;
             continue;
         }
-        if cur_h + MIN_GAP + h > avail {
+        // Gap between prev strip and this one accounts for protrusions
+        let prev_eb = strip_info[i - 1].2;
+        let gap = MIN_GAP + prev_eb + ea;
+        if cur_h + gap + h > avail {
             breaks[i] = true;
             cur_h = h;
         } else {
-            cur_h += MIN_GAP + h;
+            cur_h += gap + h;
         }
     }
     breaks
@@ -78,16 +101,14 @@ fn compute_page_breaks(strip_heights: &[f32], header_h: Option<f32>) -> Vec<bool
 fn write_one_part(
     src: &Document,
     src_pages: &[ObjectId],
-    entries: &[(u32, Band)],
-    header: Option<&Band>,
+    entries: &[(u32, StripShape)],
+    header: Option<&StripShape>,
     page_breaks: &[bool],
     output_path: &Path,
 ) -> Result<usize> {
     let mut out = Document::with_version("1.5");
     let pages_id = out.new_object_id();
     let avail_w = PAGE_W - 2.0 * MARGIN;
-    let avail_h = PAGE_H - 2.0 * MARGIN;
-
     let mut xobj_cache: BTreeMap<u32, (ObjectId, f32)> = BTreeMap::new();
 
     // Pre-fetch XObject for a page, caching results
@@ -102,12 +123,12 @@ fn write_one_part(
         Ok((id, pw))
     };
 
-    // A strip to render: source page xobject + band in source coords + scale
+    // A strip to render: source page xobject + shape in source coords + scale
     struct Strip {
         xobj_id: ObjectId,
-        band: Band,
+        shape: StripShape,
         scale: f32,
-        height: f32, // in output pts
+        height: f32,     // base band height in output pts
     }
 
     // Group systems into pages
@@ -120,10 +141,10 @@ fn write_one_part(
     let mut pages: Vec<PageGroup> = Vec::new();
     let mut cur_group: Option<PageGroup> = None;
 
-    for (sys_idx, &(page_idx, band)) in entries.iter().enumerate() {
-        let (xobj_id, pw) = get_xobj(page_idx, &mut out)?;
+    for (sys_idx, (page_idx, shape)) in entries.iter().enumerate() {
+        let (xobj_id, pw) = get_xobj(*page_idx, &mut out)?;
         let scale = avail_w / pw;
-        let h = (band.y_top - band.y_bot) * scale;
+        let h = (shape.base.y_top - shape.base.y_bot) * scale;
 
         if page_breaks[sys_idx] {
             if let Some(g) = cur_group.take() {
@@ -132,9 +153,14 @@ fn write_one_part(
             // New page group
             let hdr_strip = if sys_idx == 0 {
                 header.and_then(|hdr| {
-                    let h = (hdr.y_top - hdr.y_bot) * scale;
+                    let h = (hdr.base.y_top - hdr.base.y_bot) * scale;
                     if h > 0.0 {
-                        Some(Strip { xobj_id, band: *hdr, scale, height: h })
+                        Some(Strip {
+                            xobj_id,
+                            shape: hdr.clone(),
+                            scale,
+                            height: h,
+                        })
                     } else {
                         None
                     }
@@ -146,7 +172,12 @@ fn write_one_part(
         }
 
         if h > 0.0 {
-            cur_group.as_mut().unwrap().systems.push(Strip { xobj_id, band, scale, height: h });
+            cur_group.as_mut().unwrap().systems.push(Strip {
+                xobj_id,
+                shape: shape.clone(),
+                scale,
+                height: h,
+            });
         }
     }
     if let Some(g) = cur_group {
@@ -164,37 +195,71 @@ fn write_one_part(
             continue;
         }
 
-        let total_h: f32 = all_strips.iter().map(|s| s.height).sum();
-        let num_gaps = if n > 1 { n - 1 } else { 0 };
-        // Justify spacing, but cap the gap so sparse pages don't look too spread out.
-        let max_gap = 2.5 * MIN_GAP;
-        let gap = if num_gaps > 0 {
-            let justified = (avail_h - total_h) / num_gaps as f32;
-            justified.clamp(MIN_GAP, max_gap)
-        } else {
-            0.0
-        };
+        // Compute gaps between consecutive strips.
+        // Ensure at least MIN_GAP between the visual extents (including protrusions).
+        let gaps: Vec<f32> = (0..n.saturating_sub(1)).map(|i| {
+            let strip_a = all_strips[i];
+            let strip_b = all_strips[i + 1];
+            // How far strip_a's protrusions extend below its base band (in output pts)
+            let a_below: f32 = strip_a.shape.protrusions.iter()
+                .filter(|p| p.y_bot < strip_a.shape.base.y_bot)
+                .map(|p| (strip_a.shape.base.y_bot - p.y_bot) * strip_a.scale)
+                .fold(0.0f32, f32::max);
+            // How far strip_b's protrusions extend above its base band (in output pts)
+            let b_above: f32 = strip_b.shape.protrusions.iter()
+                .filter(|p| p.y_top > strip_b.shape.base.y_top)
+                .map(|p| (p.y_top - strip_b.shape.base.y_top) * strip_b.scale)
+                .fold(0.0f32, f32::max);
+            // Gap must accommodate both protrusions plus MIN_GAP clearance
+            MIN_GAP + a_below + b_above
+        }).collect();
 
         let mut streams: Vec<String> = Vec::new();
         let mut xobjs: Vec<(String, ObjectId)> = Vec::new();
         let mut cur_y = PAGE_H - MARGIN;
 
-        for strip in &all_strips {
+        for (strip_idx, strip) in all_strips.iter().enumerate() {
             let h = strip.height;
             let dest_y_top = cur_y;
             let dest_y_bot = dest_y_top - h;
             let tx = MARGIN;
-            let ty = dest_y_bot - strip.band.y_bot * strip.scale;
+            let ty = dest_y_bot - strip.shape.base.y_bot * strip.scale;
 
             let name = format!("X{}", xobj_counter);
             xobj_counter += 1;
             xobjs.push((name.clone(), strip.xobj_id));
-            streams.push(format!(
-                "q\n{x1} {y1} {w} {h} re W n\n{a} 0 0 {d} {tx} {ty} cm\n/{name} Do\nQ",
+
+            // Build clip path: base rectangle + protrusion rectangles
+            let mut clip_rects = format!(
+                "{x1} {y1} {w} {h} re",
                 x1 = MARGIN, y1 = dest_y_bot, w = avail_w, h = h,
+            );
+
+            // Add protrusion rectangles (in output coordinates)
+            for prot in &strip.shape.protrusions {
+                // Convert protrusion from source PDF coords to output coords
+                let prot_x = MARGIN + prot.x_left * strip.scale;
+                let prot_w = (prot.x_right - prot.x_left) * strip.scale;
+                // Protrusion y coords in source PDF space → output space
+                let prot_y_top_out = dest_y_bot + (prot.y_top - strip.shape.base.y_bot) * strip.scale;
+                let prot_y_bot_out = dest_y_bot + (prot.y_bot - strip.shape.base.y_bot) * strip.scale;
+                let prot_h = prot_y_top_out - prot_y_bot_out;
+                if prot_h > 0.0 && prot_w > 0.0 {
+                    clip_rects.push_str(&format!(
+                        "\n{x} {y} {w} {h} re",
+                        x = prot_x, y = prot_y_bot_out, w = prot_w, h = prot_h,
+                    ));
+                }
+            }
+
+            streams.push(format!(
+                "q\n{clip}\nW n\n{a} 0 0 {d} {tx} {ty} cm\n/{name} Do\nQ",
+                clip = clip_rects,
                 a = strip.scale, d = strip.scale, tx = tx, ty = ty, name = name,
             ));
-            cur_y = dest_y_bot - gap;
+            // Use per-gap spacing to prevent protrusion overlap
+            let this_gap = if strip_idx < gaps.len() { gaps[strip_idx] } else { 0.0 };
+            cur_y = dest_y_bot - this_gap;
         }
 
         let content_id = out.add_object(Stream::new(
